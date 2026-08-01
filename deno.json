@@ -3,5 +3,8 @@
   "imports": {
     "zod": "npm:zod@4.4.3"
   },
-  "nodeModulesDir": "none"
+  "nodeModulesDir": "none",
+  "tasks": {
+    "check": "deno fmt --check && deno lint && deno check mod.ts mod_test.ts && deno test"
+  }
 }
