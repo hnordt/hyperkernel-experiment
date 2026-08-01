@@ -317,12 +317,6 @@ function registered<Definition extends Resource<string>>(
   return actual;
 }
 
-function isPromise(value: unknown): value is PromiseLike<unknown> {
-  return value !== null &&
-    (typeof value === "object" || typeof value === "function") &&
-    "then" in value && typeof value.then === "function";
-}
-
 export function kernel<Environment extends { database: DatabaseSync }>(
   options: KernelOptions<Environment>,
 ) {
@@ -380,10 +374,10 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     },
   });
 
-  function dispatch<Input extends ZodType>(
+  async function dispatch<Input extends ZodType>(
     definition: Resource<"command"> & Readonly<{ input: Input }>,
     input: z.input<Input>,
-  ): void {
+  ): Promise<void> {
     const command = registered(commands, definition) as RuntimeCommand;
     const raised = command.handle(commandContext, command.input.parse(input));
 
@@ -437,11 +431,7 @@ export function kernel<Environment extends { database: DatabaseSync }>(
 
     for (const queued of queuedEffects) {
       const effect = registered(effects, queued.effect) as RuntimeEffect;
-      const result = effect.run(options.env, queued.input);
-
-      if (isPromise(result)) {
-        throw new TypeError(`Effect ${effect.type} returned a Promise`);
-      }
+      await effect.run(options.env, queued.input);
     }
   }
 

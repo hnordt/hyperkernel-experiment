@@ -33,7 +33,7 @@ const PlaceOrder = command({
 type Environment = Readonly<{
   database: DatabaseSync;
   mailer: Readonly<{
-    sendOrderConfirmation(customerId: number): void;
+    sendOrderConfirmation(customerId: number): Promise<void>;
   }>;
 }>;
 
@@ -42,8 +42,8 @@ const SendOrderConfirmation = effect({
   input: z.object({
     customerId: z.number().int(),
   }),
-  run(environment: Environment, input) {
-    environment.mailer.sendOrderConfirmation(input.customerId);
+  async run(environment: Environment, input) {
+    await environment.mailer.sendOrderConfirmation(input.customerId);
   },
 });
 
@@ -142,7 +142,8 @@ function createApp(
     env: {
       database,
       mailer: {
-        sendOrderConfirmation(customerId: number) {
+        async sendOrderConfirmation(customerId: number) {
+          await Promise.resolve();
           sent.push(customerId);
         },
       },
@@ -183,14 +184,14 @@ export function environmentTypeChecks(database: DatabaseSync): void {
   });
 }
 
-Deno.test("dispatches one command through event, projection, listener, and effect", () => {
+Deno.test("dispatches one command through event, projection, listener, and async effect", async () => {
   const database = createDatabase();
   const sent: number[] = [];
 
   try {
     const app = createApp(database, sent);
 
-    app.dispatch(PlaceOrder, { customerId: 42 });
+    await app.dispatch(PlaceOrder, { customerId: 42 });
 
     assert.deepEqual(app.query(GetUsers, { limit: 10 }), [
       { customerId: 42 },
@@ -202,14 +203,14 @@ Deno.test("dispatches one command through event, projection, listener, and effec
   }
 });
 
-Deno.test("rejects invalid command input before changing state", () => {
+Deno.test("rejects invalid command input before changing state", async () => {
   const database = createDatabase();
   const sent: number[] = [];
 
   try {
     const app = createApp(database, sent);
 
-    assert.throws(
+    await assert.rejects(
       () => app.dispatch(PlaceOrder, { customerId: "invalid" } as never),
       isZodError,
     );
@@ -221,7 +222,7 @@ Deno.test("rejects invalid command input before changing state", () => {
   }
 });
 
-Deno.test("parses transformed event and effect values once", () => {
+Deno.test("parses transformed event and effect values once", async () => {
   const database = createDatabase();
   const transformed: number[] = [];
   const NumberWasReceived = event({
@@ -266,7 +267,7 @@ Deno.test("parses transformed event and effect values once", () => {
       env: {
         database,
         mailer: {
-          sendOrderConfirmation() {},
+          async sendOrderConfirmation() {},
         },
       },
       commands: [ReceiveNumber],
@@ -277,7 +278,7 @@ Deno.test("parses transformed event and effect values once", () => {
       queries: [],
     });
 
-    app.dispatch(ReceiveNumber, "42");
+    await app.dispatch(ReceiveNumber, "42");
 
     assert.deepEqual(transformed, [42]);
     assert.equal(userCount(database), 1);
@@ -286,7 +287,7 @@ Deno.test("parses transformed event and effect values once", () => {
   }
 });
 
-Deno.test("rolls back earlier writes when a projector writes outside its table", () => {
+Deno.test("rolls back earlier writes when a projector writes outside its table", async () => {
   const database = createDatabase();
   const sent: number[] = [];
   const InvalidOther = projector({
@@ -304,7 +305,7 @@ Deno.test("rolls back earlier writes when a projector writes outside its table",
   try {
     const app = createApp(database, sent, [Users, InvalidOther], []);
 
-    assert.throws(
+    await assert.rejects(
       () => app.dispatch(PlaceOrder, { customerId: 42 }),
       Error,
     );

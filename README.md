@@ -1,6 +1,6 @@
 # Hyperkernel experiment
 
-A deliberately small experiment for synchronous commands, events, effects,
+A deliberately small experiment for commands, events, effects, synchronous
 SQLite projectors, and typed queries.
 
 The implementation uses:
@@ -52,15 +52,15 @@ const PlaceOrder = command({
 type Environment = Readonly<{
   database: DatabaseSync;
   mailer: Readonly<{
-    sendOrderConfirmation(customerId: number): void;
+    sendOrderConfirmation(customerId: number): Promise<void>;
   }>;
 }>;
 
 const SendOrderConfirmation = effect({
   type: "SendOrderConfirmation",
   input: z.object({ customerId: z.number().int() }),
-  run(environment: Environment, input) {
-    environment.mailer.sendOrderConfirmation(input.customerId);
+  async run(environment: Environment, input) {
+    await environment.mailer.sendOrderConfirmation(input.customerId);
   },
 });
 
@@ -103,7 +103,7 @@ const app = kernel({
   env: {
     database,
     mailer: {
-      sendOrderConfirmation(customerId) {
+      async sendOrderConfirmation(customerId) {
         console.log("Send confirmation to", customerId);
       },
     },
@@ -116,12 +116,12 @@ const app = kernel({
   queries: [GetUsers],
 });
 
-app.dispatch(PlaceOrder, { customerId: 42 });
+await app.dispatch(PlaceOrder, { customerId: 42 });
 
 console.log(app.query(GetUsers, { limit: 10 }));
 ```
 
-## Synchronous flow
+## Dispatch flow
 
 `dispatch()` performs one deterministic sequence:
 
@@ -131,13 +131,13 @@ console.log(app.query(GetUsers, { limit: 10 }));
 4. Start `BEGIN IMMEDIATE`.
 5. Append the event and update its projectors.
 6. Commit the SQLite transaction.
-7. Run queued effects synchronously through `env`.
+7. Run and await queued effects sequentially through `env`.
 
 If projection SQL fails, the event and every projection update roll back.
 Effects run after commit, so an effect failure cannot undo the accepted event.
 
-In this version, `queue()` means "run after commit in the same `dispatch()`
-call." It is not a durable or asynchronous queue.
+In this version, `queue()` means "run after commit before `dispatch()`
+resolves." It is not a durable queue.
 
 ## SQL boundaries
 
@@ -155,9 +155,10 @@ tables, constraints, and indexes remain explicitly defined by the application.
 
 ## Deliberately omitted
 
-This first version does not include modules, async handlers, multiple events per
-command, multiple effects per listener, rejection results, migrations, replay,
-projection checkpoints, an outbox, retries, idempotency, or concurrency.
+This first version does not include modules, async command, listener, projector,
+or query handlers, multiple events per command, multiple effects per listener,
+rejection results, migrations, replay, projection checkpoints, an outbox,
+retries, idempotency, or concurrency.
 
 ## Development
 
