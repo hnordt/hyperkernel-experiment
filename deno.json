@@ -1,0 +1,7 @@
+{
+  "exports": "./mod.ts",
+  "imports": {
+    "zod": "npm:zod@4.4.3"
+  },
+  "nodeModulesDir": "none"
+}
