@@ -370,6 +370,31 @@ Deno.test("denies mutations returned by queries", () => {
   }
 });
 
+Deno.test("does not reuse an authorized projector statement for a query", async () => {
+  const database = createDatabase();
+  const sent: number[] = [];
+  const InsertUser = query({
+    type: "InsertUser",
+    input: z.object({ customerId: z.number().int() }),
+    reads: [Users],
+    output: z.array(Users.schema),
+    run(input) {
+      return sql`INSERT INTO users (customer_id) VALUES (${input.customerId})`;
+    },
+  });
+
+  try {
+    const app = createApp(database, sent, [Users], [InsertUser]);
+    await app.dispatch(PlaceOrder, { customerId: 42 });
+
+    assert.throws(() => app.query(InsertUser, { customerId: 43 }), Error);
+    assert.equal(eventCount(database), 1);
+    assert.equal(userCount(database), 1);
+  } finally {
+    database.close();
+  }
+});
+
 Deno.test("denies queries that read an undeclared projector", () => {
   const database = createDatabase();
   const sent: number[] = [];

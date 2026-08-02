@@ -30,6 +30,19 @@ Deno.test("benchmark smoke run verifies every lane without performance threshold
 
     const expectedEvents = sample.lane === "crud" ? 0 : 20;
     assert.equal(sample.afterErase.stats.eventCount, expectedEvents);
+
+    const expectedSqliteCalls = sample.lane === "hyperkernel"
+      ? {
+        statementPreparations: 5,
+        authorizerInstallations: 1,
+        authorizerClears: 0,
+      }
+      : {
+        statementPreparations: 0,
+        authorizerInstallations: 0,
+        authorizerClears: 0,
+      };
+    assert.deepEqual(sample.sqliteCalls.total, expectedSqliteCalls);
   }
 
   for (const summary of report.summaries) {
