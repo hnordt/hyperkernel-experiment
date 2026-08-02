@@ -153,6 +153,18 @@ connection.
 `projector.schema` is the Zod row contract. It is not a migration DSL. SQLite
 tables, constraints, and indexes remain explicitly defined by the application.
 
+## Definition graph
+
+`kernel()` validates its static definition graph before changing the database:
+
+- Types must be unique within each resource kind.
+- Listener and projection events must be the exact registered event objects.
+- Query dependencies must be the exact registered projector objects.
+
+Command handlers create accepted event descriptions through `context.raise()`;
+listener handlers create post-commit effect descriptions through
+`context.queue()`. Their data is parsed once at those boundaries.
+
 ## Deliberately omitted
 
 This first version does not include modules, async command, listener, projector,
