@@ -12,6 +12,7 @@ import {
   query,
   sql,
 } from "./mod.ts";
+import { sqliteCallCounts } from "./sqlite_instrumentation.ts";
 
 const OrderWasPlaced = event({
   type: "OrderWasPlaced",
@@ -365,6 +366,67 @@ Deno.test("denies mutations returned by queries", () => {
     const app = createApp(database, sent, [Users], [MutateUsers]);
 
     assert.throws(() => app.query(MutateUsers, {}), Error);
+  } finally {
+    database.close();
+  }
+});
+
+Deno.test("preserves query authorization after the connection authorizer changes", () => {
+  const database = createDatabase();
+  const sent: number[] = [];
+  const MutateUsers = query({
+    type: "MutateUsers",
+    input: z.object({}),
+    reads: [Users],
+    output: z.array(Users.schema),
+    run() {
+      return sql`DELETE FROM users`;
+    },
+  });
+
+  try {
+    const app = createApp(database, sent, [Users], [MutateUsers]);
+    const authorizedDatabase = database as DatabaseSync & {
+      setAuthorizer(authorizer: null): void;
+    };
+
+    authorizedDatabase.setAuthorizer(null);
+
+    assert.throws(() => app.query(MutateUsers, {}), Error);
+  } finally {
+    database.close();
+  }
+});
+
+Deno.test("bounds cached statements for input-dependent SQL text", () => {
+  const database = createDatabase();
+  const sent: number[] = [];
+  const DynamicGetUsers = query({
+    type: "DynamicGetUsers",
+    input: z.object({ limit: z.number().int().positive() }),
+    reads: [Users],
+    output: z.array(Users.schema),
+    run(input) {
+      return {
+        text:
+          `SELECT customer_id AS customerId FROM users LIMIT ${input.limit}`,
+        parameters: [],
+      };
+    },
+  });
+
+  try {
+    const app = createApp(database, sent, [Users], [DynamicGetUsers]);
+    const before = sqliteCallCounts().statementPreparations;
+
+    for (let limit = 1; limit <= 65; limit += 1) {
+      app.query(DynamicGetUsers, { limit });
+    }
+
+    app.query(DynamicGetUsers, { limit: 1 });
+
+    const after = sqliteCallCounts().statementPreparations;
+    assert.equal(after - before, 66);
   } finally {
     database.close();
   }

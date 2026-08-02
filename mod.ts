@@ -239,7 +239,10 @@ type PreparedStatement = ReturnType<DatabaseSync["prepare"]>;
 
 type AuthorizationState = {
   active: Authorizer | null;
+  external: Authorizer | null;
 };
+
+const maxCachedStatementsPerScope = 64;
 
 // Deno 2.9 implements SQLite authorization, while its node:sqlite types lag.
 const authorization = constants as
@@ -303,15 +306,32 @@ function authorizationState(
   let state = authorizationStates.get(database);
 
   if (state === undefined) {
-    state = { active: null };
+    state = { active: null, external: null };
     const installedState = state;
+    const setAuthorizer = database.setAuthorizer.bind(database);
+    const installedAuthorizer: Authorizer = (...args) => {
+      const decision = installedState.active?.(...args);
 
-    // The inactive policy matches having no authorizer, while one stable
-    // callback avoids invalidating every cached statement between operations.
-    database.setAuthorizer((...args) =>
-      installedState.active?.(...args) ?? authorization.SQLITE_OK
-    );
+      if (decision !== undefined && decision !== authorization.SQLITE_OK) {
+        return decision;
+      }
+
+      return installedState.external?.(...args) ?? authorization.SQLITE_OK;
+    };
+
+    setAuthorizer(installedAuthorizer);
     recordAuthorizerInstallation();
+
+    // Keep the kernel callback installed when application code changes the
+    // connection authorizer, and retain native statement invalidation.
+    Object.defineProperty(database, "setAuthorizer", {
+      configurable: true,
+      value(external: Authorizer | null) {
+        installedState.external = external;
+        setAuthorizer(installedAuthorizer);
+        recordAuthorizerInstallation();
+      },
+    });
     authorizationStates.set(database, state);
   }
 
@@ -368,7 +388,6 @@ export function kernel<Environment extends { database: DatabaseSync }>(
   const projectorTables = new Set<string>();
   const internalStatementScope = Object.freeze({});
   // Scope identity prevents identical SQL from crossing authorization bounds.
-  // Closing the database finalizes the retained native statements.
   const statementsByScope = new Map<object, Map<string, PreparedStatement>>();
 
   function prepare(scope: object, text: string): PreparedStatement {
@@ -379,12 +398,24 @@ export function kernel<Environment extends { database: DatabaseSync }>(
       statementsByScope.set(scope, statements);
     }
 
-    let statement = statements.get(text);
+    const cached = statements.get(text);
 
-    if (statement === undefined) {
-      recordStatementPreparation();
-      statement = database.prepare(text);
-      statements.set(text, statement);
+    if (cached !== undefined) {
+      statements.delete(text);
+      statements.set(text, cached);
+      return cached;
+    }
+
+    recordStatementPreparation();
+    const statement = database.prepare(text);
+    statements.set(text, statement);
+
+    if (statements.size > maxCachedStatementsPerScope) {
+      const leastRecentlyUsed = statements.keys().next().value;
+
+      if (leastRecentlyUsed !== undefined) {
+        statements.delete(leastRecentlyUsed);
+      }
     }
 
     return statement;
