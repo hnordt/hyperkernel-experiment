@@ -7,7 +7,6 @@ import {
   event,
   kernel,
   listener,
-  project,
   projector,
   query,
   sql,
@@ -62,13 +61,15 @@ const Users = projector({
   schema: z.object({
     customerId: z.number().int(),
   }),
-  apply: [
-    project(
-      OrderWasPlaced,
-      (data) =>
-        sql`INSERT INTO users (customer_id) VALUES (${data.customerId})`,
-    ),
-  ],
+  apply(project) {
+    return [
+      project(
+        OrderWasPlaced,
+        (data) =>
+          sql`INSERT INTO users (customer_id) VALUES (${data.customerId})`,
+      ),
+    ];
+  },
 });
 
 const GetUsers = query({
@@ -129,15 +130,8 @@ function isZodError(error: unknown): boolean {
 function createApp(
   database: DatabaseSync,
   sent: number[],
-  projectors: readonly Readonly<{
-    kind: "projector";
-    type: string;
-    table: string;
-  }>[] = [Users],
-  queries: readonly Readonly<{
-    kind: "query";
-    type: string;
-  }>[] = [GetUsers],
+  projectors: Parameters<typeof kernel>[0]["projectors"] = [Users],
+  queries: Parameters<typeof kernel>[0]["queries"] = [GetUsers],
 ) {
   return kernel({
     env: {
@@ -164,6 +158,60 @@ export function typeChecks(app: ReturnType<typeof createApp>): void {
 
   // @ts-expect-error limit is a number
   app.query(GetUsers, { limit: "10" });
+
+  const handmadeCommandValue = {
+    kind: "command",
+    type: "HandmadeCommand",
+    input: z.object({}),
+  } as const;
+  // @ts-expect-error command descriptors must come from command()
+  const handmadeCommand: Parameters<typeof app.dispatch>[0] =
+    handmadeCommandValue;
+
+  const handmadeQueryValue = {
+    kind: "query",
+    type: "HandmadeQuery",
+    input: z.object({}),
+    output: z.array(z.object({})),
+  } as const;
+  // @ts-expect-error query descriptors must come from query()
+  const handmadeQuery: Parameters<typeof app.query>[0] = handmadeQueryValue;
+
+  const RawCommandResult = command({
+    type: "RawCommandResult",
+    input: z.object({ customerId: z.number().int() }),
+    handle(context, input) {
+      const raw = {
+        kind: "raised-event" as const,
+        event: OrderWasPlaced,
+        data: input,
+      };
+
+      // @ts-expect-error command results must come from context.raise()
+      const result: ReturnType<typeof context.raise> = raw;
+      return result;
+    },
+  });
+  const RawListenerResult = listener({
+    type: "RawListenerResult",
+    on: OrderWasPlaced,
+    handle(context, data) {
+      const raw = {
+        kind: "queued-effect" as const,
+        effect: SendOrderConfirmation,
+        input: data,
+      };
+
+      // @ts-expect-error listener results must come from context.queue()
+      const result: ReturnType<typeof context.queue> = raw;
+      return result;
+    },
+  });
+
+  void handmadeCommand;
+  void handmadeQuery;
+  void RawCommandResult;
+  void RawListenerResult;
 }
 
 export function environmentTypeChecks(database: DatabaseSync): void {
@@ -223,6 +271,133 @@ Deno.test("rejects invalid command input before changing state", async () => {
   }
 });
 
+Deno.test("rejects a forged command descriptor at the kernel boundary", () => {
+  const database = createDatabase();
+  const handmadeCommand = {
+    kind: "command",
+    type: "HandmadeCommand",
+    input: z.object({}),
+    handle() {},
+  } as unknown as Parameters<typeof kernel>[0]["commands"][number];
+
+  try {
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [handmadeCommand],
+          events: [],
+          listeners: [],
+          effects: [],
+          projectors: [],
+          queries: [],
+        }),
+      TypeError,
+    );
+    assert.equal(userCount(database), 0);
+    assert.equal(
+      database.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = '__hyperkernel_events'",
+      ).get(),
+      undefined,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+Deno.test("rejects a forged command result before changing state", async () => {
+  const database = createDatabase();
+  const sent: number[] = [];
+  const ForgeRaisedEvent = command({
+    type: "ForgeRaisedEvent",
+    input: z.object({ customerId: z.number().int() }),
+    handle(context, input) {
+      return {
+        kind: "raised-event",
+        event: OrderWasPlaced,
+        data: input,
+      } as unknown as ReturnType<typeof context.raise>;
+    },
+  });
+
+  try {
+    const app = kernel({
+      env: {
+        database,
+        mailer: {
+          async sendOrderConfirmation(customerId: number) {
+            await Promise.resolve();
+            sent.push(customerId);
+          },
+        },
+      },
+      commands: [ForgeRaisedEvent],
+      events: [OrderWasPlaced],
+      listeners: [SendConfirmationWhenOrderPlaced],
+      effects: [SendOrderConfirmation],
+      projectors: [Users],
+      queries: [],
+    });
+
+    await assert.rejects(
+      () => app.dispatch(ForgeRaisedEvent, { customerId: 42 }),
+      TypeError,
+    );
+    assert.equal(eventCount(database), 0);
+    assert.equal(userCount(database), 0);
+    assert.deepEqual(sent, []);
+  } finally {
+    database.close();
+  }
+});
+
+Deno.test("rejects a forged listener result before changing state", async () => {
+  const database = createDatabase();
+  const sent: number[] = [];
+  const ForgeQueuedEffect = listener({
+    type: "ForgeQueuedEffect",
+    on: OrderWasPlaced,
+    handle(context, data) {
+      return {
+        kind: "queued-effect",
+        effect: SendOrderConfirmation,
+        input: data,
+      } as unknown as ReturnType<typeof context.queue>;
+    },
+  });
+
+  try {
+    const app = kernel({
+      env: {
+        database,
+        mailer: {
+          async sendOrderConfirmation(customerId: number) {
+            await Promise.resolve();
+            sent.push(customerId);
+          },
+        },
+      },
+      commands: [PlaceOrder],
+      events: [OrderWasPlaced],
+      listeners: [ForgeQueuedEffect],
+      effects: [SendOrderConfirmation],
+      projectors: [Users],
+      queries: [],
+    });
+
+    await assert.rejects(
+      () => app.dispatch(PlaceOrder, { customerId: 42 }),
+      TypeError,
+    );
+    assert.equal(eventCount(database), 0);
+    assert.equal(userCount(database), 0);
+    assert.deepEqual(sent, []);
+  } finally {
+    database.close();
+  }
+});
+
 Deno.test("parses transformed event and effect values once", async () => {
   const database = createDatabase();
   const transformed: number[] = [];
@@ -255,12 +430,14 @@ Deno.test("parses transformed event and effect values once", async () => {
     type: "Numbers",
     table: "users",
     schema: Users.schema,
-    apply: [
-      project(
-        NumberWasReceived,
-        (data) => sql`INSERT INTO users (customer_id) VALUES (${data})`,
-      ),
-    ],
+    apply(project) {
+      return [
+        project(
+          NumberWasReceived,
+          (data) => sql`INSERT INTO users (customer_id) VALUES (${data})`,
+        ),
+      ];
+    },
   });
 
   try {
@@ -295,12 +472,14 @@ Deno.test("rolls back earlier writes when a projector writes outside its table",
     type: "InvalidOther",
     table: "other",
     schema: z.object({ value: z.number().int() }),
-    apply: [
-      project(
-        OrderWasPlaced,
-        (data) => sql`UPDATE users SET customer_id = ${data.customerId}`,
-      ),
-    ],
+    apply(project) {
+      return [
+        project(
+          OrderWasPlaced,
+          (data) => sql`UPDATE users SET customer_id = ${data.customerId}`,
+        ),
+      ];
+    },
   });
 
   try {
@@ -329,13 +508,17 @@ Deno.test("rejects reserved and duplicate projector tables", () => {
     type: "Reserved",
     table: "__hyperkernel_events",
     schema: z.object({}),
-    apply: [],
+    apply() {
+      return [];
+    },
   });
   const DuplicateUsers = projector({
     type: "DuplicateUsers",
     table: "users",
     schema: Users.schema,
-    apply: [],
+    apply() {
+      return [];
+    },
   });
 
   try {
@@ -464,7 +647,9 @@ Deno.test("denies queries that read an undeclared projector", () => {
     type: "Other",
     table: "other",
     schema: z.object({ value: z.number().int() }),
-    apply: [],
+    apply() {
+      return [];
+    },
   });
   const ReadOther = query({
     type: "ReadOther",

@@ -1,13 +1,5 @@
 import { z } from "zod";
-import {
-  command,
-  event,
-  kernel,
-  project,
-  projector,
-  query,
-  sql,
-} from "../../mod.ts";
+import { command, event, kernel, projector, query, sql } from "../../mod.ts";
 import {
   CreateTodoInputSchema,
   orderTodos,
@@ -73,31 +65,33 @@ const Todos = projector({
   type: "Todos",
   table: "todos",
   schema: TodoRowSchema,
-  apply: [
-    project(
-      TodoCreated,
-      (data) =>
-        sql`
-          INSERT INTO todos (id, title, completed, created_at)
-          VALUES (${data.id}, ${data.title}, ${
-          Number(data.completed)
-        }, ${data.createdAt})
-        `,
-    ),
-    project(
-      TodoCompletionChanged,
-      (data) =>
-        sql`
-          UPDATE todos
-          SET completed = ${Number(data.completed)}
-          WHERE id = ${data.id}
-        `,
-    ),
-    project(
-      TodoDeleted,
-      (data) => sql`DELETE FROM todos WHERE id = ${data.id}`,
-    ),
-  ],
+  apply(project) {
+    return [
+      project(
+        TodoCreated,
+        (data) =>
+          sql`
+            INSERT INTO todos (id, title, completed, created_at)
+            VALUES (${data.id}, ${data.title}, ${
+            Number(data.completed)
+          }, ${data.createdAt})
+          `,
+      ),
+      project(
+        TodoCompletionChanged,
+        (data) =>
+          sql`
+            UPDATE todos
+            SET completed = ${Number(data.completed)}
+            WHERE id = ${data.id}
+          `,
+      ),
+      project(
+        TodoDeleted,
+        (data) => sql`DELETE FROM todos WHERE id = ${data.id}`,
+      ),
+    ];
+  },
 });
 
 const GetTodo = query({

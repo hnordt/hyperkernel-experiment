@@ -5,24 +5,76 @@ import {
   recordStatementPreparation,
 } from "./sqlite_instrumentation.ts";
 
-type Resource<Kind extends string> = Readonly<{
-  kind: Kind;
-  type: string;
+declare const definitionBrand: unique symbol;
+
+type DefinitionHandle<Kind extends string, Contract> = Readonly<{
+  [definitionBrand]: Readonly<{
+    kind: Kind;
+    contract: Contract;
+  }>;
 }>;
 
 type Event<Data extends ZodType = ZodType> =
-  & Resource<"event">
-  & Readonly<{ data: Data }>;
+  & DefinitionHandle<"event", Data>
+  & Readonly<{ type: string }>;
 
-type Effect<Input extends ZodType = ZodType> =
-  & Resource<"effect">
-  & Readonly<{ input: Input }>;
+type Command<Input extends ZodType = ZodType> = DefinitionHandle<
+  "command",
+  Input
+>;
 
-type EnvironmentEffect<Environment> =
-  & Effect
-  & Readonly<{
-    run: (environment: Environment, input: never) => unknown;
-  }>;
+type Effect<
+  Input extends ZodType = ZodType,
+  Environment = unknown,
+> = DefinitionHandle<
+  "effect",
+  Readonly<{
+    input: Input;
+    environment: (environment: Environment) => void;
+  }>
+>;
+
+type EnvironmentEffect<Environment> = Effect<ZodType, Environment>;
+
+type Listener<Data extends ZodType = ZodType> = DefinitionHandle<
+  "listener",
+  Data
+>;
+
+type Projector<Schema extends ZodType = ZodType> =
+  & DefinitionHandle<"projector", Schema>
+  & Readonly<{ schema: Schema }>;
+
+type Query<
+  Input extends ZodType = ZodType,
+  Output extends ZodType = ZodType,
+> = DefinitionHandle<
+  "query",
+  Readonly<{ input: Input; output: Output }>
+>;
+
+declare const raisedEventBrand: unique symbol;
+
+type RaisedEvent = Readonly<{
+  [raisedEventBrand]: true;
+}>;
+
+declare const queuedEffectBrand: unique symbol;
+
+type QueuedEffect = Readonly<{
+  [queuedEffectBrand]: true;
+}>;
+
+declare const projectionRuleBrand: unique symbol;
+
+type ProjectionRule = Readonly<{
+  [projectionRuleBrand]: true;
+}>;
+
+type Project = <Data extends ZodType>(
+  on: Event<Data>,
+  build: (data: z.output<Data>) => SqlStatement,
+) => ProjectionRule;
 
 export type SqlStatement = Readonly<{
   text: string;
@@ -44,17 +96,19 @@ export function sql(
 
 export function event<const Type extends string, Data extends ZodType>(
   definition: Readonly<{ type: Type; data: Data }>,
-) {
-  return Object.freeze({ kind: "event" as const, ...definition });
+): Event<Data> & Readonly<{ type: Type }> {
+  const handle = Object.freeze({ type: definition.type }) as
+    & Event<Data>
+    & Readonly<{ type: Type }>;
+
+  return registerDefinition(handle, {
+    kind: "event",
+    type: definition.type,
+    data: definition.data,
+  });
 }
 
-type RaisedEvent = Readonly<{
-  kind: "raised-event";
-  event: Resource<"event">;
-  data: unknown;
-}>;
-
-export type CommandContext = Readonly<{
+type CommandContext = Readonly<{
   raise<Data extends ZodType>(
     event: Event<Data>,
     data: z.input<Data>,
@@ -70,8 +124,15 @@ export function command<const Type extends string, Input extends ZodType>(
       input: z.output<Input>,
     ): RaisedEvent | undefined;
   }>,
-) {
-  return Object.freeze({ kind: "command" as const, ...definition });
+): Command<Input> {
+  const handle = Object.freeze({}) as Command<Input>;
+
+  return registerDefinition(handle, {
+    kind: "command",
+    type: definition.type,
+    input: definition.input,
+    handle: definition.handle as RuntimeCommand["handle"],
+  });
 }
 
 export function effect<
@@ -84,19 +145,20 @@ export function effect<
     input: Input;
     run(environment: Environment, input: z.output<Input>): unknown;
   }>,
-) {
-  return Object.freeze({ kind: "effect" as const, ...definition });
+): Effect<Input, Environment> {
+  const handle = Object.freeze({}) as Effect<Input, Environment>;
+
+  return registerDefinition(handle, {
+    kind: "effect",
+    type: definition.type,
+    input: definition.input,
+    run: definition.run as RuntimeEffect["run"],
+  });
 }
 
-type QueuedEffect = Readonly<{
-  kind: "queued-effect";
-  effect: Resource<"effect">;
-  input: unknown;
-}>;
-
-export type ListenerContext = Readonly<{
-  queue<Input extends ZodType>(
-    effect: Effect<Input>,
+type ListenerContext = Readonly<{
+  queue<Input extends ZodType, Environment>(
+    effect: Effect<Input, Environment>,
     input: z.input<Input>,
   ): QueuedEffect;
 }>;
@@ -113,20 +175,15 @@ export function listener<
       data: z.output<Data>,
     ): QueuedEffect | undefined;
   }>,
-) {
-  return Object.freeze({ kind: "listener" as const, ...definition });
-}
+): Listener<Data> {
+  const handle = Object.freeze({}) as Listener<Data>;
 
-type ProjectionRule = Readonly<{
-  on: Event;
-  sql(data: never): SqlStatement;
-}>;
-
-export function project<Data extends ZodType>(
-  on: Event<Data>,
-  build: (data: z.output<Data>) => SqlStatement,
-): ProjectionRule {
-  return Object.freeze({ on, sql: build });
+  return registerDefinition(handle, {
+    kind: "listener",
+    type: definition.type,
+    on: definition.on,
+    handle: definition.handle as RuntimeListener["handle"],
+  });
 }
 
 export function projector<const Type extends string, Schema extends ZodType>(
@@ -134,21 +191,48 @@ export function projector<const Type extends string, Schema extends ZodType>(
     type: Type;
     table: string;
     schema: Schema;
-    apply: readonly ProjectionRule[];
+    apply(project: Project): readonly ProjectionRule[];
   }>,
-) {
-  return Object.freeze({
-    kind: "projector" as const,
-    ...definition,
-    apply: Object.freeze([...definition.apply]),
+): Projector<Schema> {
+  const projectionDefinitions = new WeakMap<
+    ProjectionRule,
+    RuntimeProjectionRule
+  >();
+  const project: Project = <Data extends ZodType>(
+    on: Event<Data>,
+    build: (data: z.output<Data>) => SqlStatement,
+  ) => {
+    runtimeDefinition(on, "event");
+    const rule = Object.freeze({}) as ProjectionRule;
+    projectionDefinitions.set(
+      rule,
+      Object.freeze({
+        on,
+        sql: build as RuntimeProjectionRule["sql"],
+      }),
+    );
+    return rule;
+  };
+  const apply = definition.apply(project).map((rule) => {
+    const application = projectionDefinitions.get(rule);
+
+    if (application === undefined) {
+      throw new TypeError("Invalid projection rule");
+    }
+
+    return application;
+  });
+  const handle = Object.freeze({ schema: definition.schema }) as Projector<
+    Schema
+  >;
+
+  return registerDefinition(handle, {
+    kind: "projector",
+    type: definition.type,
+    table: definition.table,
+    apply: Object.freeze(apply),
   });
 }
-
-type Projector =
-  & Resource<"projector">
-  & Readonly<{
-    table: string;
-  }>;
 
 export function query<
   const Type extends string,
@@ -163,63 +247,107 @@ export function query<
     output: Output;
     run(input: z.output<Input>): SqlStatement;
   }>,
-) {
-  return Object.freeze({
-    kind: "query" as const,
-    ...definition,
-    reads: Object.freeze([...definition.reads]) as unknown as Reads,
+): Query<Input, Output> {
+  const handle = Object.freeze({}) as Query<Input, Output>;
+
+  return registerDefinition(handle, {
+    kind: "query",
+    type: definition.type,
+    input: definition.input,
+    reads: Object.freeze([...definition.reads]),
+    output: definition.output,
+    run: definition.run as RuntimeQuery["run"],
   });
 }
 
 type KernelOptions<Environment extends { database: DatabaseSync }> = Readonly<{
   env: Environment;
-  commands: readonly Resource<"command">[];
-  events: readonly Resource<"event">[];
-  listeners: readonly Resource<"listener">[];
+  commands: readonly Command[];
+  events: readonly Event[];
+  listeners: readonly Listener[];
   effects: readonly EnvironmentEffect<NoInfer<Environment>>[];
   projectors: readonly Projector[];
-  queries: readonly Resource<"query">[];
+  queries: readonly Query[];
 }>;
 
-type RuntimeCommand =
-  & Resource<"command">
-  & Readonly<{
-    input: ZodType;
-    handle(context: CommandContext, input: unknown): RaisedEvent | undefined;
-  }>;
+type RuntimeCommand = Readonly<{
+  kind: "command";
+  type: string;
+  input: ZodType;
+  handle(context: CommandContext, input: unknown): RaisedEvent | undefined;
+}>;
 
-type RuntimeEvent = Event;
+type RuntimeEvent = Readonly<{
+  kind: "event";
+  type: string;
+  data: ZodType;
+}>;
 
-type RuntimeListener =
-  & Resource<"listener">
-  & Readonly<{
-    on: Resource<"event">;
-    handle(context: ListenerContext, data: unknown): QueuedEffect | undefined;
-  }>;
+type RuntimeListener = Readonly<{
+  kind: "listener";
+  type: string;
+  on: Event;
+  handle(context: ListenerContext, data: unknown): QueuedEffect | undefined;
+}>;
 
-type RuntimeEffect =
-  & Effect
-  & Readonly<{
-    run(environment: unknown, input: unknown): unknown;
-  }>;
+type RuntimeEffect = Readonly<{
+  kind: "effect";
+  type: string;
+  input: ZodType;
+  run(environment: unknown, input: unknown): unknown;
+}>;
 
-type RuntimeProjector =
-  & Projector
-  & Readonly<{
-    apply: readonly Readonly<{
-      on: Resource<"event">;
-      sql(data: unknown): SqlStatement;
-    }>[];
-  }>;
+type RuntimeProjectionRule = Readonly<{
+  on: Event;
+  sql(data: unknown): SqlStatement;
+}>;
 
-type RuntimeQuery =
-  & Resource<"query">
-  & Readonly<{
-    input: ZodType;
-    reads: readonly Projector[];
-    output: ZodType;
-    run(input: unknown): SqlStatement;
-  }>;
+type RuntimeProjector = Readonly<{
+  kind: "projector";
+  type: string;
+  table: string;
+  apply: readonly RuntimeProjectionRule[];
+}>;
+
+type RuntimeQuery = Readonly<{
+  kind: "query";
+  type: string;
+  input: ZodType;
+  reads: readonly Projector[];
+  output: ZodType;
+  run(input: unknown): SqlStatement;
+}>;
+
+type RuntimeDefinition =
+  | RuntimeCommand
+  | RuntimeEffect
+  | RuntimeEvent
+  | RuntimeListener
+  | RuntimeProjector
+  | RuntimeQuery;
+
+const definitionRegistry = new WeakMap<object, RuntimeDefinition>();
+
+function registerDefinition<Handle extends object>(
+  handle: Handle,
+  definition: RuntimeDefinition,
+): Handle {
+  definitionRegistry.set(handle, Object.freeze(definition));
+  return handle;
+}
+
+function runtimeDefinition<Kind extends RuntimeDefinition["kind"]>(
+  handle: object,
+  kind: Kind,
+): Extract<RuntimeDefinition, Readonly<{ kind: Kind }>> {
+  const definition = definitionRegistry.get(handle);
+
+  if (definition?.kind !== kind) {
+    throw new TypeError(`Invalid ${kind} definition`);
+  }
+
+  return definition as Extract<RuntimeDefinition, Readonly<{ kind: Kind }>>;
+}
 
 type Authorizer = (
   action: number,
@@ -354,36 +482,39 @@ function authorized<Result>(
   }
 }
 
-function index<Definition extends Resource<string>>(
-  definitions: readonly Definition[],
-): Map<string, Definition> {
+function index<Kind extends RuntimeDefinition["kind"]>(
+  handles: readonly object[],
+  kind: Kind,
+): Map<string, object> {
   return new Map(
-    definitions.map((definition) => [definition.type, definition]),
+    handles.map((handle) => [runtimeDefinition(handle, kind).type, handle]),
   );
 }
 
-function registered<Definition extends Resource<string>>(
-  definitions: ReadonlyMap<string, Definition>,
-  expected: Resource<string>,
-): Definition {
-  const actual = definitions.get(expected.type);
+function registered<Kind extends RuntimeDefinition["kind"]>(
+  handles: ReadonlyMap<string, object>,
+  expected: object,
+  kind: Kind,
+): Extract<RuntimeDefinition, Readonly<{ kind: Kind }>> {
+  const definition = runtimeDefinition(expected, kind);
+  const actual = handles.get(definition.type);
 
   if (actual !== expected) {
-    throw new Error(`Unregistered ${expected.kind}: ${expected.type}`);
+    throw new Error(`Unregistered ${kind}: ${definition.type}`);
   }
 
-  return actual;
+  return definition;
 }
 
 export function kernel<Environment extends { database: DatabaseSync }>(
   options: KernelOptions<Environment>,
 ) {
-  const commands = index(options.commands);
-  const events = index(options.events);
-  const listeners = index(options.listeners);
-  const effects = index(options.effects);
-  const projectors = index(options.projectors);
-  const queries = index(options.queries);
+  const commands = index(options.commands, "command");
+  const events = index(options.events, "event");
+  const listeners = index(options.listeners, "listener");
+  const effects = index(options.effects, "effect");
+  const projectors = index(options.projectors, "projector");
+  const queries = index(options.queries, "query");
   const database = options.env.database as AuthorizedDatabase;
   const projectorTables = new Set<string>();
   const internalStatementScope = Object.freeze({});
@@ -421,7 +552,9 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     return statement;
   }
 
-  for (const definition of projectors.values()) {
+  for (const handle of projectors.values()) {
+    const definition = runtimeDefinition(handle, "projector");
+
     if (definition.table.startsWith("__hyperkernel_")) {
       throw new Error(`Reserved projector table: ${definition.table}`);
     }
@@ -462,7 +595,7 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     if (policy === undefined) {
       const tables = new Set(
         query.reads.map((dependency) =>
-          registered(projectors, dependency).table
+          registered(projectors, dependency, "projector").table
         ),
       );
       policy = authorizer(tables, false);
@@ -472,42 +605,67 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     return policy;
   }
 
+  const raisedEvents = new WeakMap<
+    RaisedEvent,
+    Readonly<{ event: Event; data: unknown }>
+  >();
+  const queuedEffects = new WeakMap<
+    QueuedEffect,
+    Readonly<{ effect: object; input: unknown }>
+  >();
+
   const commandContext: CommandContext = Object.freeze({
     raise<Data extends ZodType>(definition: Event<Data>, data: z.input<Data>) {
-      const event = registered(events, definition) as RuntimeEvent;
-      return Object.freeze({
-        kind: "raised-event" as const,
-        event,
-        data: event.data.parse(data),
-      });
+      const event = registered(events, definition, "event");
+      const raised = Object.freeze({}) as RaisedEvent;
+      raisedEvents.set(
+        raised,
+        Object.freeze({
+          event: definition,
+          data: event.data.parse(data),
+        }),
+      );
+      return raised;
     },
   });
 
   const listenerContext: ListenerContext = Object.freeze({
-    queue<Input extends ZodType>(
-      definition: Effect<Input>,
+    queue<Input extends ZodType, EffectEnvironment>(
+      definition: Effect<Input, EffectEnvironment>,
       input: z.input<Input>,
     ) {
-      const effect = registered(effects, definition) as RuntimeEffect;
-      return Object.freeze({
-        kind: "queued-effect" as const,
-        effect,
-        input: effect.input.parse(input),
-      });
+      const effect = registered(effects, definition, "effect");
+      const queued = Object.freeze({}) as QueuedEffect;
+      queuedEffects.set(
+        queued,
+        Object.freeze({
+          effect: definition,
+          input: effect.input.parse(input),
+        }),
+      );
+      return queued;
     },
   });
 
   async function dispatch<Input extends ZodType>(
-    definition: Resource<"command"> & Readonly<{ input: Input }>,
+    definition: Command<Input>,
     input: z.input<Input>,
   ): Promise<void> {
-    const command = registered(commands, definition) as RuntimeCommand;
+    const command = registered(commands, definition, "command");
     const raised = command.handle(commandContext, command.input.parse(input));
 
     if (raised === undefined) return;
 
-    const event = registered(events, raised.event) as RuntimeEvent;
-    const data = raised.data;
+    const raisedEvent = raisedEvents.get(raised);
+
+    if (raisedEvent === undefined) {
+      throw new TypeError(`Command ${command.type} returned an invalid result`);
+    }
+
+    raisedEvents.delete(raised);
+    const eventHandle = raisedEvent.event;
+    const event = registered(events, eventHandle, "event");
+    const data = raisedEvent.data;
     const serialized = JSON.stringify(data);
 
     if (serialized === undefined) {
@@ -515,21 +673,35 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     }
 
     const projectionPlans = [...projectors.values()]
-      .map((definition) => definition as RuntimeProjector)
+      .map((handle) => runtimeDefinition(handle, "projector"))
       .flatMap((projector) =>
         projector.apply
-          .filter((application) => application.on === event)
+          .filter((application) => application.on === eventHandle)
           .map((application) => ({
             projector,
             statement: application.sql(data),
           }))
       );
 
-    const queuedEffects = [...listeners.values()]
-      .map((definition) => definition as RuntimeListener)
-      .filter((listener) => listener.on === event)
-      .map((listener) => listener.handle(listenerContext, data))
-      .filter((queued): queued is QueuedEffect => queued !== undefined);
+    const effectPlans = [...listeners.values()]
+      .map((handle) => runtimeDefinition(handle, "listener"))
+      .filter((listener) => listener.on === eventHandle)
+      .flatMap((listener) => {
+        const queued = listener.handle(listenerContext, data);
+
+        if (queued === undefined) return [];
+
+        const effect = queuedEffects.get(queued);
+
+        if (effect === undefined) {
+          throw new TypeError(
+            `Listener ${listener.type} returned an invalid result`,
+          );
+        }
+
+        queuedEffects.delete(queued);
+        return [effect];
+      });
 
     database.exec("BEGIN IMMEDIATE");
 
@@ -553,22 +725,17 @@ export function kernel<Environment extends { database: DatabaseSync }>(
       throw error;
     }
 
-    for (const queued of queuedEffects) {
-      const effect = registered(effects, queued.effect) as RuntimeEffect;
+    for (const queued of effectPlans) {
+      const effect = registered(effects, queued.effect, "effect");
       await effect.run(options.env, queued.input);
     }
   }
 
   function runQuery<Input extends ZodType, Output extends ZodType>(
-    definition:
-      & Resource<"query">
-      & Readonly<{
-        input: Input;
-        output: Output;
-      }>,
+    definition: Query<Input, Output>,
     input: z.input<Input>,
   ): z.output<Output> {
-    const query = registered(queries, definition) as RuntimeQuery;
+    const query = registered(queries, definition, "query");
     const statement = query.run(query.input.parse(input));
     const rows = authorized(
       authorizers,

@@ -10,6 +10,9 @@ The implementation uses:
 - Deno's built-in synchronous `node:sqlite` API
 - One SQLite connection and one writer
 
+Factories return opaque handles, and handlers must return only values created by
+`raise()` or `queue()`.
+
 ## Example
 
 ```ts
@@ -21,7 +24,6 @@ import {
   event,
   kernel,
   listener,
-  project,
   projector,
   query,
   sql,
@@ -76,13 +78,15 @@ const Users = projector({
   type: "Users",
   table: "users",
   schema: z.object({ customerId: z.number().int() }),
-  apply: [
-    project(
-      OrderWasPlaced,
-      (data) =>
-        sql`INSERT INTO users (customer_id) VALUES (${data.customerId})`,
-    ),
-  ],
+  apply(project) {
+    return [
+      project(
+        OrderWasPlaced,
+        (data) =>
+          sql`INSERT INTO users (customer_id) VALUES (${data.customerId})`,
+      ),
+    ];
+  },
 });
 
 const GetUsers = query({
