@@ -349,6 +349,102 @@ Deno.test("rejects reserved and duplicate projector tables", () => {
   }
 });
 
+Deno.test("rejects duplicate and unregistered definitions during setup", () => {
+  const database = createDatabase();
+  const DuplicateOrderWasPlaced = event({
+    type: "OrderWasPlaced",
+    data: z.object({ customerId: z.number().int() }),
+  });
+  const OrphanEvent = event({
+    type: "OrphanEvent",
+    data: z.object({ customerId: z.number().int() }),
+  });
+  const OrphanListener = listener({
+    type: "OrphanListener",
+    on: OrphanEvent,
+    handle() {
+      return undefined;
+    },
+  });
+  const OrphanProjector = projector({
+    type: "OrphanProjector",
+    table: "other",
+    schema: z.object({ value: z.number().int() }),
+    apply: [
+      project(
+        OrphanEvent,
+        (data) => sql`INSERT INTO other (value) VALUES (${data.customerId})`,
+      ),
+    ],
+  });
+  const OrphanQuery = query({
+    type: "OrphanQuery",
+    input: z.object({}),
+    reads: [OrphanProjector],
+    output: z.array(OrphanProjector.schema),
+    run() {
+      return sql`SELECT value FROM other`;
+    },
+  });
+
+  try {
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [],
+          events: [OrderWasPlaced, DuplicateOrderWasPlaced],
+          listeners: [],
+          effects: [],
+          projectors: [],
+          queries: [],
+        }),
+      /Duplicate event: OrderWasPlaced/,
+    );
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [],
+          events: [OrderWasPlaced],
+          listeners: [OrphanListener],
+          effects: [],
+          projectors: [],
+          queries: [],
+        }),
+      /Unregistered event: OrphanEvent/,
+    );
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [],
+          events: [OrderWasPlaced],
+          listeners: [],
+          effects: [],
+          projectors: [OrphanProjector],
+          queries: [],
+        }),
+      /Unregistered event: OrphanEvent/,
+    );
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [],
+          events: [OrderWasPlaced],
+          listeners: [],
+          effects: [],
+          projectors: [],
+          queries: [OrphanQuery],
+        }),
+      /Unregistered projector: OrphanProjector/,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 Deno.test("denies mutations returned by queries", () => {
   const database = createDatabase();
   const sent: number[] = [];
