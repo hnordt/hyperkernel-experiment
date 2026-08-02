@@ -5,6 +5,9 @@
   },
   "nodeModulesDir": "none",
   "tasks": {
-    "check": "deno fmt --check && deno lint && deno check mod.ts mod_test.ts && deno test"
+    "check": "deno fmt --check && deno lint && deno check mod.ts mod_test.ts experiments/todo-comparison/*.ts experiments/todo-comparison/public/app.js && deno test --allow-read=deno.json,mod.ts,experiments/todo-comparison --allow-write=experiments/todo-comparison",
+    "todo:test": "deno test --allow-read=deno.json,mod.ts,experiments/todo-comparison --allow-write=experiments/todo-comparison experiments/todo-comparison",
+    "todo:serve": "deno run --allow-net=127.0.0.1 --allow-read=experiments/todo-comparison --allow-write=experiments/todo-comparison/data experiments/todo-comparison/server.ts",
+    "todo:bench": "deno run --allow-read=deno.json,mod.ts,experiments/todo-comparison --allow-write=experiments/todo-comparison experiments/todo-comparison/benchmark.ts"
   }
 }

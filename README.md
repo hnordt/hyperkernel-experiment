@@ -165,3 +165,17 @@ retries, idempotency, or concurrency.
 ```sh
 deno task check
 ```
+
+## Experiments
+
+The [`experiments`](./experiments/README.md) folder contains runnable
+comparisons that use the current kernel without changing its public API.
+
+The first experiment implements the same SQLite Todo app with Hyperkernel and
+traditional CRUD, then measures create, point-read, list-read, and erase paths:
+
+```sh
+deno task todo:test
+deno task todo:serve
+deno task todo:bench
+```

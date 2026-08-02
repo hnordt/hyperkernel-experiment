@@ -1,0 +1,5 @@
+experiments/todo-comparison/data/
+experiments/todo-comparison/.server-test-*/
+experiments/todo-comparison/.todo-test-*/
+experiments/todo-comparison/.todo-benchmark-*/
+experiments/todo-comparison/todo-benchmark.json
