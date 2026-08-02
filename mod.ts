@@ -1,5 +1,9 @@
 import { constants, type DatabaseSync, type SQLInputValue } from "node:sqlite";
 import type { z, ZodType } from "zod";
+import {
+  recordAuthorizerInstallation,
+  recordStatementPreparation,
+} from "./sqlite_instrumentation.ts";
 
 type Resource<Kind extends string> = Readonly<{
   kind: Kind;
@@ -231,6 +235,15 @@ type AuthorizedDatabase =
     setAuthorizer(authorizer: Authorizer | null): void;
   }>;
 
+type PreparedStatement = ReturnType<DatabaseSync["prepare"]>;
+
+type AuthorizationState = {
+  active: Authorizer | null;
+  external: Authorizer | null;
+};
+
+const maxCachedStatementsPerScope = 64;
+
 // Deno 2.9 implements SQLite authorization, while its node:sqlite types lag.
 const authorization = constants as
   & typeof constants
@@ -258,6 +271,11 @@ const writeActions = new Set([
   authorization.SQLITE_UPDATE,
 ]);
 
+const authorizationStates = new WeakMap<
+  AuthorizedDatabase,
+  AuthorizationState
+>();
+
 function authorizer(
   tables: ReadonlySet<string>,
   writes: boolean,
@@ -282,17 +300,57 @@ function authorizer(
   };
 }
 
-function authorized<Result>(
+function authorizationState(
   database: AuthorizedDatabase,
+): AuthorizationState {
+  let state = authorizationStates.get(database);
+
+  if (state === undefined) {
+    state = { active: null, external: null };
+    const installedState = state;
+    const setAuthorizer = database.setAuthorizer.bind(database);
+    const installedAuthorizer: Authorizer = (...args) => {
+      const decision = installedState.active?.(...args);
+
+      if (decision !== undefined && decision !== authorization.SQLITE_OK) {
+        return decision;
+      }
+
+      return installedState.external?.(...args) ?? authorization.SQLITE_OK;
+    };
+
+    setAuthorizer(installedAuthorizer);
+    recordAuthorizerInstallation();
+
+    // Keep the kernel callback installed when application code changes the
+    // connection authorizer, and retain native statement invalidation.
+    Object.defineProperty(database, "setAuthorizer", {
+      configurable: true,
+      value(external: Authorizer | null) {
+        installedState.external = external;
+        setAuthorizer(installedAuthorizer);
+        recordAuthorizerInstallation();
+      },
+    });
+    authorizationStates.set(database, state);
+  }
+
+  return state;
+}
+
+function authorized<Result>(
+  state: AuthorizationState,
   policy: Authorizer,
   run: () => Result,
 ): Result {
-  database.setAuthorizer(policy);
+  const previous = state.active;
+  state.active = policy;
 
   try {
+    // SQLite can recompile during execution after a schema change.
     return run();
   } finally {
-    database.setAuthorizer(null);
+    state.active = previous;
   }
 }
 
@@ -328,6 +386,40 @@ export function kernel<Environment extends { database: DatabaseSync }>(
   const queries = index(options.queries);
   const database = options.env.database as AuthorizedDatabase;
   const projectorTables = new Set<string>();
+  const internalStatementScope = Object.freeze({});
+  // Scope identity prevents identical SQL from crossing authorization bounds.
+  const statementsByScope = new Map<object, Map<string, PreparedStatement>>();
+
+  function prepare(scope: object, text: string): PreparedStatement {
+    let statements = statementsByScope.get(scope);
+
+    if (statements === undefined) {
+      statements = new Map();
+      statementsByScope.set(scope, statements);
+    }
+
+    const cached = statements.get(text);
+
+    if (cached !== undefined) {
+      statements.delete(text);
+      statements.set(text, cached);
+      return cached;
+    }
+
+    recordStatementPreparation();
+    const statement = database.prepare(text);
+    statements.set(text, statement);
+
+    if (statements.size > maxCachedStatementsPerScope) {
+      const leastRecentlyUsed = statements.keys().next().value;
+
+      if (leastRecentlyUsed !== undefined) {
+        statements.delete(leastRecentlyUsed);
+      }
+    }
+
+    return statement;
+  }
 
   for (const definition of projectors.values()) {
     if (definition.table.startsWith("__hyperkernel_")) {
@@ -348,6 +440,37 @@ export function kernel<Environment extends { database: DatabaseSync }>(
       data TEXT NOT NULL
     ) STRICT
   `);
+
+  const authorizers = authorizationState(database);
+  const projectorAuthorizers = new Map<RuntimeProjector, Authorizer>();
+  const queryAuthorizers = new Map<RuntimeQuery, Authorizer>();
+
+  function projectorAuthorizer(projector: RuntimeProjector): Authorizer {
+    let policy = projectorAuthorizers.get(projector);
+
+    if (policy === undefined) {
+      policy = authorizer(new Set([projector.table]), true);
+      projectorAuthorizers.set(projector, policy);
+    }
+
+    return policy;
+  }
+
+  function queryAuthorizer(query: RuntimeQuery): Authorizer {
+    let policy = queryAuthorizers.get(query);
+
+    if (policy === undefined) {
+      const tables = new Set(
+        query.reads.map((dependency) =>
+          registered(projectors, dependency).table
+        ),
+      );
+      policy = authorizer(tables, false);
+      queryAuthorizers.set(query, policy);
+    }
+
+    return policy;
+  }
 
   const commandContext: CommandContext = Object.freeze({
     raise<Data extends ZodType>(definition: Event<Data>, data: z.input<Data>) {
@@ -411,15 +534,16 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     database.exec("BEGIN IMMEDIATE");
 
     try {
-      database.prepare(
+      prepare(
+        internalStatementScope,
         "INSERT INTO __hyperkernel_events (type, data) VALUES (?, ?)",
       ).run(event.type, serialized);
 
       for (const { projector, statement } of projectionPlans) {
         authorized(
-          database,
-          authorizer(new Set([projector.table]), true),
-          () => database.prepare(statement.text).run(...statement.parameters),
+          authorizers,
+          projectorAuthorizer(projector),
+          () => prepare(projector, statement.text).run(...statement.parameters),
         );
       }
 
@@ -446,13 +570,10 @@ export function kernel<Environment extends { database: DatabaseSync }>(
   ): z.output<Output> {
     const query = registered(queries, definition) as RuntimeQuery;
     const statement = query.run(query.input.parse(input));
-    const tables = new Set(
-      query.reads.map((dependency) => registered(projectors, dependency).table),
-    );
     const rows = authorized(
-      database,
-      authorizer(tables, false),
-      () => database.prepare(statement.text).all(...statement.parameters),
+      authorizers,
+      queryAuthorizer(query),
+      () => prepare(query, statement.text).all(...statement.parameters),
     );
 
     return query.output.parse(rows) as z.output<Output>;

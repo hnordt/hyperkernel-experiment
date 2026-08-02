@@ -4,6 +4,10 @@ import { DatabaseSync } from "node:sqlite";
 import { createAuditedCrudTodoStore } from "./audited_crud_store.ts";
 import { createCrudTodoStore } from "./crud_store.ts";
 import { createHyperkernelTodoStore } from "./hyperkernel_store.ts";
+import {
+  type SqliteCallCounts,
+  sqliteCallCounts,
+} from "../../sqlite_instrumentation.ts";
 
 type HyperkernelTodoStore = ReturnType<typeof createHyperkernelTodoStore>;
 type TodoInput = Parameters<HyperkernelTodoStore["create"]>[0];
@@ -69,6 +73,15 @@ type TimedPhases = Readonly<{
   lifecycle: number;
 }>;
 
+export type BenchmarkSqliteCalls = Readonly<{
+  setup: SqliteCallCounts;
+  create: SqliteCallCounts;
+  "point-read": SqliteCallCounts;
+  "list-read": SqliteCallCounts;
+  erase: SqliteCallCounts;
+  total: SqliteCallCounts;
+}>;
+
 export type BenchmarkSample = Readonly<{
   lane: BenchmarkLane;
   engine: string;
@@ -76,6 +89,7 @@ export type BenchmarkSample = Readonly<{
   milliseconds: TimedPhases;
   checksum: number;
   integrityCheck: string;
+  sqliteCalls: BenchmarkSqliteCalls;
   afterCreate: Readonly<{
     stats: BenchmarkStoreStats;
     files: DatabaseFileStats;
@@ -263,6 +277,19 @@ async function elapsed(run: () => void | Promise<void>): Promise<number> {
   return Math.max(performance.now() - startedAt, 0.000_001);
 }
 
+function subtractSqliteCalls(
+  after: SqliteCallCounts,
+  before: SqliteCallCounts,
+): SqliteCallCounts {
+  return Object.freeze({
+    statementPreparations: after.statementPreparations -
+      before.statementPreparations,
+    authorizerInstallations: after.authorizerInstallations -
+      before.authorizerInstallations,
+    authorizerClears: after.authorizerClears - before.authorizerClears,
+  });
+}
+
 async function fileSize(path: string): Promise<number> {
   try {
     return (await Deno.stat(path)).size;
@@ -405,7 +432,9 @@ async function runLifecycle(
   databasePath: string,
   sample: number,
 ): Promise<BenchmarkSample> {
+  const beforeSetupCalls = sqliteCallCounts();
   const store = definition.createStore(databasePath);
+  const afterSetupCalls = sqliteCallCounts();
 
   try {
     const pointResults = new Array<Todo | null>(workload.pointReadIds.length);
@@ -417,6 +446,7 @@ async function runLifecycle(
         await store.create(fixture);
       }
     });
+    const afterCreateCalls = sqliteCallCounts();
 
     const afterCreateStats = store.stats();
     const afterCreateFiles = await databaseFileStats(databasePath);
@@ -426,18 +456,21 @@ async function runLifecycle(
         pointResults[index] = store.get(workload.pointReadIds[index]);
       }
     });
+    const afterPointReadCalls = sqliteCallCounts();
 
     const listReadMs = await elapsed(() => {
       for (let index = 0; index < listReads; index += 1) {
         listResults[index] = store.list();
       }
     });
+    const afterListReadCalls = sqliteCallCounts();
 
     const eraseMs = await elapsed(async () => {
       for (let index = 0; index < workload.fixtures.length; index += 1) {
         eraseResults[index] = await store.remove(workload.fixtures[index].id);
       }
     });
+    const afterEraseCalls = sqliteCallCounts();
 
     const afterEraseStats = store.stats();
     const afterEraseFiles = await databaseFileStats(databasePath);
@@ -474,6 +507,20 @@ async function runLifecycle(
       }),
       checksum: checksum(verifiedPointReads),
       integrityCheck,
+      sqliteCalls: Object.freeze({
+        setup: subtractSqliteCalls(afterSetupCalls, beforeSetupCalls),
+        create: subtractSqliteCalls(afterCreateCalls, afterSetupCalls),
+        "point-read": subtractSqliteCalls(
+          afterPointReadCalls,
+          afterCreateCalls,
+        ),
+        "list-read": subtractSqliteCalls(
+          afterListReadCalls,
+          afterPointReadCalls,
+        ),
+        erase: subtractSqliteCalls(afterEraseCalls, afterListReadCalls),
+        total: subtractSqliteCalls(afterEraseCalls, beforeSetupCalls),
+      }),
       afterCreate: Object.freeze({
         stats: afterCreateStats,
         files: afterCreateFiles,
@@ -944,6 +991,34 @@ function formatReport(report: BenchmarkReport): string {
       } | ${storage.afterEraseEventCount ?? "n/a"} | ${
         storage.journalModes.join(", ")
       } | ${storage.integrityChecks.join(", ")} |`,
+    );
+  }
+
+  const hyperkernelSample = report.samples.find((sample) =>
+    sample.lane === "hyperkernel"
+  );
+  assert.ok(hyperkernelSample);
+  lines.push(
+    "",
+    "Hyperkernel SQLite calls per sample:",
+    "",
+    "| phase | statement preparations | authorizer installations | authorizer clears |",
+    "| --- | ---: | ---: | ---: |",
+  );
+
+  for (
+    const phase of [
+      "setup",
+      "create",
+      "point-read",
+      "list-read",
+      "erase",
+      "total",
+    ] as const
+  ) {
+    const counts = hyperkernelSample.sqliteCalls[phase];
+    lines.push(
+      `| ${phase} | ${counts.statementPreparations} | ${counts.authorizerInstallations} | ${counts.authorizerClears} |`,
     );
   }
 
