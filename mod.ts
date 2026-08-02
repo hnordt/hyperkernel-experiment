@@ -18,11 +18,17 @@ type Effect<Input extends ZodType = ZodType> =
   & Resource<"effect">
   & Readonly<{ input: Input }>;
 
-type EnvironmentEffect<Environment> =
+type RegisteredEffect<Environment> =
   & Effect
   & Readonly<{
     run: (environment: Environment, input: never) => unknown;
   }>;
+
+// Schema-specific callback arguments are erased while heterogeneous
+// definitions are stored, then restored at the single invocation boundary.
+type ErasedCallback<Result = unknown> = (...args: never[]) => Result;
+
+const actionToken = Symbol("hyperkernel-action");
 
 export type SqlStatement = Readonly<{
   text: string;
@@ -45,10 +51,11 @@ export function sql(
 export function event<const Type extends string, Data extends ZodType>(
   definition: Readonly<{ type: Type; data: Data }>,
 ) {
-  return Object.freeze({ kind: "event" as const, ...definition });
+  return Object.freeze({ ...definition, kind: "event" as const });
 }
 
 type RaisedEvent = Readonly<{
+  [actionToken]: "raised-event";
   kind: "raised-event";
   event: Resource<"event">;
   data: unknown;
@@ -71,7 +78,7 @@ export function command<const Type extends string, Input extends ZodType>(
     ): RaisedEvent | undefined;
   }>,
 ) {
-  return Object.freeze({ kind: "command" as const, ...definition });
+  return Object.freeze({ ...definition, kind: "command" as const });
 }
 
 export function effect<
@@ -85,10 +92,11 @@ export function effect<
     run(environment: Environment, input: z.output<Input>): unknown;
   }>,
 ) {
-  return Object.freeze({ kind: "effect" as const, ...definition });
+  return Object.freeze({ ...definition, kind: "effect" as const });
 }
 
 type QueuedEffect = Readonly<{
+  [actionToken]: "queued-effect";
   kind: "queued-effect";
   effect: Resource<"effect">;
   input: unknown;
@@ -114,7 +122,7 @@ export function listener<
     ): QueuedEffect | undefined;
   }>,
 ) {
-  return Object.freeze({ kind: "listener" as const, ...definition });
+  return Object.freeze({ ...definition, kind: "listener" as const });
 }
 
 type ProjectionRule = Readonly<{
@@ -138,8 +146,8 @@ export function projector<const Type extends string, Schema extends ZodType>(
   }>,
 ) {
   return Object.freeze({
-    kind: "projector" as const,
     ...definition,
+    kind: "projector" as const,
     apply: Object.freeze([...definition.apply]),
   });
 }
@@ -149,6 +157,12 @@ type Projector =
   & Readonly<{
     table: string;
   }>;
+
+function frozenCopy<const Items extends readonly unknown[]>(
+  items: Items,
+): readonly [...Items] {
+  return Object.freeze([...items]);
+}
 
 export function query<
   const Type extends string,
@@ -165,61 +179,51 @@ export function query<
   }>,
 ) {
   return Object.freeze({
-    kind: "query" as const,
     ...definition,
-    reads: Object.freeze([...definition.reads]) as unknown as Reads,
+    kind: "query" as const,
+    reads: frozenCopy(definition.reads),
   });
 }
 
-type KernelOptions<Environment extends { database: DatabaseSync }> = Readonly<{
-  env: Environment;
-  commands: readonly Resource<"command">[];
-  events: readonly Resource<"event">[];
-  listeners: readonly Resource<"listener">[];
-  effects: readonly EnvironmentEffect<NoInfer<Environment>>[];
-  projectors: readonly Projector[];
-  queries: readonly Resource<"query">[];
-}>;
-
-type RuntimeCommand =
+type RegisteredCommand =
   & Resource<"command">
   & Readonly<{
     input: ZodType;
-    handle(context: CommandContext, input: unknown): RaisedEvent | undefined;
+    handle: ErasedCallback<RaisedEvent | undefined>;
   }>;
 
-type RuntimeEvent = Event;
-
-type RuntimeListener =
+type RegisteredListener =
   & Resource<"listener">
   & Readonly<{
-    on: Resource<"event">;
-    handle(context: ListenerContext, data: unknown): QueuedEffect | undefined;
+    on: Event;
+    handle: ErasedCallback<QueuedEffect | undefined>;
   }>;
 
-type RuntimeEffect =
-  & Effect
-  & Readonly<{
-    run(environment: unknown, input: unknown): unknown;
-  }>;
-
-type RuntimeProjector =
+type RegisteredProjector =
   & Projector
   & Readonly<{
-    apply: readonly Readonly<{
-      on: Resource<"event">;
-      sql(data: unknown): SqlStatement;
-    }>[];
+    schema: ZodType;
+    apply: readonly ProjectionRule[];
   }>;
 
-type RuntimeQuery =
+type RegisteredQuery =
   & Resource<"query">
   & Readonly<{
     input: ZodType;
     reads: readonly Projector[];
     output: ZodType;
-    run(input: unknown): SqlStatement;
+    run: ErasedCallback<SqlStatement>;
   }>;
+
+type KernelOptions<Environment extends { database: DatabaseSync }> = Readonly<{
+  env: Environment;
+  commands: readonly RegisteredCommand[];
+  events: readonly Event[];
+  listeners: readonly RegisteredListener[];
+  effects: readonly RegisteredEffect<NoInfer<Environment>>[];
+  projectors: readonly RegisteredProjector[];
+  queries: readonly RegisteredQuery[];
+}>;
 
 type Authorizer = (
   action: number,
@@ -276,7 +280,7 @@ const authorizationStates = new WeakMap<
   AuthorizationState
 >();
 
-function authorizer(
+function createTableAuthorizer(
   tables: ReadonlySet<string>,
   writes: boolean,
 ): Authorizer {
@@ -300,7 +304,7 @@ function authorizer(
   };
 }
 
-function authorizationState(
+function getAuthorizationState(
   database: AuthorizedDatabase,
 ): AuthorizationState {
   let state = authorizationStates.get(database);
@@ -338,7 +342,7 @@ function authorizationState(
   return state;
 }
 
-function authorized<Result>(
+function withAuthorization<Result>(
   state: AuthorizationState,
   policy: Authorizer,
   run: () => Result,
@@ -354,15 +358,31 @@ function authorized<Result>(
   }
 }
 
-function index<Definition extends Resource<string>>(
+function indexByType<
+  Kind extends string,
+  Definition extends Resource<Kind>,
+>(
+  kind: Kind,
   definitions: readonly Definition[],
 ): Map<string, Definition> {
-  return new Map(
-    definitions.map((definition) => [definition.type, definition]),
-  );
+  const definitionsByType = new Map<string, Definition>();
+
+  for (const definition of definitions) {
+    if (definition.kind !== kind) {
+      throw new Error(`Invalid ${kind} kind: ${definition.kind}`);
+    }
+
+    if (definitionsByType.has(definition.type)) {
+      throw new Error(`Duplicate ${kind} type: ${definition.type}`);
+    }
+
+    definitionsByType.set(definition.type, definition);
+  }
+
+  return definitionsByType;
 }
 
-function registered<Definition extends Resource<string>>(
+function requireRegistered<Definition extends Resource<string>>(
   definitions: ReadonlyMap<string, Definition>,
   expected: Resource<string>,
 ): Definition {
@@ -375,22 +395,46 @@ function registered<Definition extends Resource<string>>(
   return actual;
 }
 
+function invoke<Result>(
+  callback: ErasedCallback<Result>,
+  ...args: unknown[]
+): Result {
+  return (callback as (...args: unknown[]) => Result)(...args);
+}
+
+type Action = RaisedEvent | QueuedEffect;
+
+function requireAction<Kind extends Action["kind"]>(
+  value: unknown,
+  kind: Kind,
+): Extract<Action, { kind: Kind }> {
+  const token = value !== null && typeof value === "object"
+    ? (value as { [actionToken]?: unknown })[actionToken]
+    : undefined;
+
+  if (token !== kind) {
+    throw new TypeError(`Invalid ${kind} returned by handler`);
+  }
+
+  return value as Extract<Action, { kind: Kind }>;
+}
+
 export function kernel<Environment extends { database: DatabaseSync }>(
   options: KernelOptions<Environment>,
 ) {
-  const commands = index(options.commands);
-  const events = index(options.events);
-  const listeners = index(options.listeners);
-  const effects = index(options.effects);
-  const projectors = index(options.projectors);
-  const queries = index(options.queries);
+  const commands = indexByType("command", options.commands);
+  const events = indexByType("event", options.events);
+  const listeners = indexByType("listener", options.listeners);
+  const effects = indexByType("effect", options.effects);
+  const projectors = indexByType("projector", options.projectors);
+  const queries = indexByType("query", options.queries);
   const database = options.env.database as AuthorizedDatabase;
   const projectorTables = new Set<string>();
-  const internalStatementScope = Object.freeze({});
+  const eventLogStatementScope = Object.freeze({});
   // Scope identity prevents identical SQL from crossing authorization bounds.
   const statementsByScope = new Map<object, Map<string, PreparedStatement>>();
 
-  function prepare(scope: object, text: string): PreparedStatement {
+  function prepareCached(scope: object, text: string): PreparedStatement {
     let statements = statementsByScope.get(scope);
 
     if (statements === undefined) {
@@ -431,6 +475,20 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     }
 
     projectorTables.add(definition.table);
+
+    for (const application of definition.apply) {
+      requireRegistered(events, application.on);
+    }
+  }
+
+  for (const definition of listeners.values()) {
+    requireRegistered(events, definition.on);
+  }
+
+  for (const definition of queries.values()) {
+    for (const dependency of definition.reads) {
+      requireRegistered(projectors, dependency);
+    }
   }
 
   database.exec(`
@@ -441,31 +499,31 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     ) STRICT
   `);
 
-  const authorizers = authorizationState(database);
-  const projectorAuthorizers = new Map<RuntimeProjector, Authorizer>();
-  const queryAuthorizers = new Map<RuntimeQuery, Authorizer>();
+  const authorizationState = getAuthorizationState(database);
+  const projectorAuthorizers = new Map<RegisteredProjector, Authorizer>();
+  const queryAuthorizers = new Map<RegisteredQuery, Authorizer>();
 
-  function projectorAuthorizer(projector: RuntimeProjector): Authorizer {
+  function projectorAuthorizer(projector: RegisteredProjector): Authorizer {
     let policy = projectorAuthorizers.get(projector);
 
     if (policy === undefined) {
-      policy = authorizer(new Set([projector.table]), true);
+      policy = createTableAuthorizer(new Set([projector.table]), true);
       projectorAuthorizers.set(projector, policy);
     }
 
     return policy;
   }
 
-  function queryAuthorizer(query: RuntimeQuery): Authorizer {
+  function queryAuthorizer(query: RegisteredQuery): Authorizer {
     let policy = queryAuthorizers.get(query);
 
     if (policy === undefined) {
       const tables = new Set(
         query.reads.map((dependency) =>
-          registered(projectors, dependency).table
+          requireRegistered(projectors, dependency).table
         ),
       );
-      policy = authorizer(tables, false);
+      policy = createTableAuthorizer(tables, false);
       queryAuthorizers.set(query, policy);
     }
 
@@ -474,8 +532,9 @@ export function kernel<Environment extends { database: DatabaseSync }>(
 
   const commandContext: CommandContext = Object.freeze({
     raise<Data extends ZodType>(definition: Event<Data>, data: z.input<Data>) {
-      const event = registered(events, definition) as RuntimeEvent;
+      const event = requireRegistered(events, definition);
       return Object.freeze({
+        [actionToken]: "raised-event" as const,
         kind: "raised-event" as const,
         event,
         data: event.data.parse(data),
@@ -488,8 +547,9 @@ export function kernel<Environment extends { database: DatabaseSync }>(
       definition: Effect<Input>,
       input: z.input<Input>,
     ) {
-      const effect = registered(effects, definition) as RuntimeEffect;
+      const effect = requireRegistered(effects, definition);
       return Object.freeze({
+        [actionToken]: "queued-effect" as const,
         kind: "queued-effect" as const,
         effect,
         input: effect.input.parse(input),
@@ -497,53 +557,78 @@ export function kernel<Environment extends { database: DatabaseSync }>(
     },
   });
 
-  async function dispatch<Input extends ZodType>(
-    definition: Resource<"command"> & Readonly<{ input: Input }>,
-    input: z.input<Input>,
-  ): Promise<void> {
-    const command = registered(commands, definition) as RuntimeCommand;
-    const raised = command.handle(commandContext, command.input.parse(input));
+  type DispatchPlan = Readonly<{
+    serialized: string;
+    projections: readonly Readonly<{
+      projector: RegisteredProjector;
+      statement: SqlStatement;
+    }>[];
+    effects: readonly Readonly<{
+      effect: RegisteredEffect<NoInfer<Environment>>;
+      input: unknown;
+    }>[];
+  }>;
 
-    if (raised === undefined) return;
-
-    const event = registered(events, raised.event) as RuntimeEvent;
-    const data = raised.data;
+  function planDispatch(event: Event, data: unknown): DispatchPlan {
     const serialized = JSON.stringify(data);
 
     if (serialized === undefined) {
       throw new TypeError(`Event ${event.type} is not JSON serializable`);
     }
 
-    const projectionPlans = [...projectors.values()]
-      .map((definition) => definition as RuntimeProjector)
-      .flatMap((projector) =>
-        projector.apply
-          .filter((application) => application.on === event)
-          .map((application) => ({
-            projector,
-            statement: application.sql(data),
-          }))
-      );
+    const projections: {
+      projector: RegisteredProjector;
+      statement: SqlStatement;
+    }[] = [];
 
-    const queuedEffects = [...listeners.values()]
-      .map((definition) => definition as RuntimeListener)
-      .filter((listener) => listener.on === event)
-      .map((listener) => listener.handle(listenerContext, data))
-      .filter((queued): queued is QueuedEffect => queued !== undefined);
+    for (const projector of projectors.values()) {
+      for (const application of projector.apply) {
+        if (application.on !== event) continue;
+        projections.push({
+          projector,
+          statement: invoke(application.sql, data),
+        });
+      }
+    }
 
+    const plannedEffects: {
+      effect: RegisteredEffect<NoInfer<Environment>>;
+      input: unknown;
+    }[] = [];
+
+    for (const listener of listeners.values()) {
+      if (listener.on !== event) continue;
+
+      const result = invoke(listener.handle, listenerContext, data);
+      if (result === undefined) continue;
+
+      const queued = requireAction(result, "queued-effect");
+      plannedEffects.push({
+        effect: requireRegistered(effects, queued.effect),
+        input: queued.input,
+      });
+    }
+
+    return { serialized, projections, effects: plannedEffects };
+  }
+
+  function persistDispatch(event: Event, plan: DispatchPlan): void {
     database.exec("BEGIN IMMEDIATE");
 
     try {
-      prepare(
-        internalStatementScope,
+      prepareCached(
+        eventLogStatementScope,
         "INSERT INTO __hyperkernel_events (type, data) VALUES (?, ?)",
-      ).run(event.type, serialized);
+      ).run(event.type, plan.serialized);
 
-      for (const { projector, statement } of projectionPlans) {
-        authorized(
-          authorizers,
+      for (const { projector, statement } of plan.projections) {
+        withAuthorization(
+          authorizationState,
           projectorAuthorizer(projector),
-          () => prepare(projector, statement.text).run(...statement.parameters),
+          () =>
+            prepareCached(projector, statement.text).run(
+              ...statement.parameters,
+            ),
         );
       }
 
@@ -552,11 +637,32 @@ export function kernel<Environment extends { database: DatabaseSync }>(
       database.exec("ROLLBACK");
       throw error;
     }
+  }
 
-    for (const queued of queuedEffects) {
-      const effect = registered(effects, queued.effect) as RuntimeEffect;
-      await effect.run(options.env, queued.input);
+  async function runEffects(plan: DispatchPlan): Promise<void> {
+    for (const planned of plan.effects) {
+      await invoke(planned.effect.run, options.env, planned.input);
     }
+  }
+
+  async function dispatch<Input extends ZodType>(
+    definition: Resource<"command"> & Readonly<{ input: Input }>,
+    input: z.input<Input>,
+  ): Promise<void> {
+    const command = requireRegistered(commands, definition);
+    const result = invoke(
+      command.handle,
+      commandContext,
+      command.input.parse(input),
+    );
+
+    if (result === undefined) return;
+
+    const raised = requireAction(result, "raised-event");
+    const event = requireRegistered(events, raised.event);
+    const plan = planDispatch(event, raised.data);
+    persistDispatch(event, plan);
+    await runEffects(plan);
   }
 
   function runQuery<Input extends ZodType, Output extends ZodType>(
@@ -568,12 +674,12 @@ export function kernel<Environment extends { database: DatabaseSync }>(
       }>,
     input: z.input<Input>,
   ): z.output<Output> {
-    const query = registered(queries, definition) as RuntimeQuery;
-    const statement = query.run(query.input.parse(input));
-    const rows = authorized(
-      authorizers,
+    const query = requireRegistered(queries, definition);
+    const statement = invoke(query.run, query.input.parse(input));
+    const rows = withAuthorization(
+      authorizationState,
       queryAuthorizer(query),
-      () => prepare(query, statement.text).all(...statement.parameters),
+      () => prepareCached(query, statement.text).all(...statement.parameters),
     );
 
     return query.output.parse(rows) as z.output<Output>;

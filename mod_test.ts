@@ -129,15 +129,8 @@ function isZodError(error: unknown): boolean {
 function createApp(
   database: DatabaseSync,
   sent: number[],
-  projectors: readonly Readonly<{
-    kind: "projector";
-    type: string;
-    table: string;
-  }>[] = [Users],
-  queries: readonly Readonly<{
-    kind: "query";
-    type: string;
-  }>[] = [GetUsers],
+  projectors: readonly ReturnType<typeof projector>[] = [Users],
+  queries: readonly ReturnType<typeof query>[] = [GetUsers],
 ) {
   return kernel({
     env: {
@@ -185,6 +178,64 @@ export function environmentTypeChecks(database: DatabaseSync): void {
   });
 }
 
+export function definitionTypeChecks(database: DatabaseSync): void {
+  const IncompleteCommand = {
+    kind: "command" as const,
+    type: "IncompleteCommand",
+  };
+
+  kernel({
+    env: { database },
+    // @ts-expect-error registered commands require input and handle
+    commands: [IncompleteCommand],
+    events: [],
+    listeners: [],
+    effects: [],
+    projectors: [],
+    queries: [],
+  });
+
+  const reads = [Users];
+  const ReadonlyReads = query({
+    type: "ReadonlyReads",
+    input: z.object({}),
+    reads,
+    output: z.array(Users.schema),
+    run() {
+      return sql`SELECT customer_id AS customerId FROM users`;
+    },
+  });
+
+  // @ts-expect-error query dependencies are frozen and exposed as readonly
+  ReadonlyReads.reads.push(Users);
+
+  command({
+    type: "ForgedRaisedEvent",
+    input: z.object({}),
+    // @ts-expect-error raised events must be created by context.raise
+    handle() {
+      return {
+        kind: "raised-event" as const,
+        event: OrderWasPlaced,
+        data: { customerId: 42 },
+      };
+    },
+  });
+
+  listener({
+    type: "ForgedQueuedEffect",
+    on: OrderWasPlaced,
+    // @ts-expect-error queued effects must be created by context.queue
+    handle() {
+      return {
+        kind: "queued-effect" as const,
+        effect: SendOrderConfirmation,
+        input: { customerId: 42 },
+      };
+    },
+  });
+}
+
 Deno.test("dispatches one command through event, projection, listener, and async effect", async () => {
   const database = createDatabase();
   const sent: number[] = [];
@@ -218,6 +269,83 @@ Deno.test("rejects invalid command input before changing state", async () => {
     assert.equal(eventCount(database), 0);
     assert.equal(userCount(database), 0);
     assert.deepEqual(sent, []);
+  } finally {
+    database.close();
+  }
+});
+
+Deno.test("factories own their resource discriminator", () => {
+  const definition = {
+    kind: "not-an-event" as const,
+    type: "FactoryOwnedKind",
+    data: z.object({}),
+  };
+
+  const FactoryOwnedKind = event(definition);
+
+  assert.equal(FactoryOwnedKind.kind, "event");
+});
+
+Deno.test("rejects handler results not created by raise or queue", async () => {
+  const database = createDatabase();
+  const forgedRaised = command({
+    type: "ForgedRaised",
+    input: z.object({}),
+    handle() {
+      return {
+        kind: "raised-event" as const,
+        event: OrderWasPlaced,
+        data: { customerId: 42 },
+      } as never;
+    },
+  });
+  const forgedQueued = listener({
+    type: "ForgedQueued",
+    on: OrderWasPlaced,
+    handle() {
+      return {
+        kind: "queued-effect" as const,
+        effect: SendOrderConfirmation,
+        input: { customerId: 42 },
+      } as never;
+    },
+  });
+
+  try {
+    const forgedRaisedApp = kernel({
+      env: { database },
+      commands: [forgedRaised],
+      events: [OrderWasPlaced],
+      listeners: [],
+      effects: [],
+      projectors: [],
+      queries: [],
+    });
+
+    await assert.rejects(
+      () => forgedRaisedApp.dispatch(forgedRaised, {}),
+      /Invalid raised-event returned by handler/,
+    );
+    assert.equal(eventCount(database), 0);
+
+    const forgedQueuedApp = kernel({
+      env: {
+        database,
+        mailer: { async sendOrderConfirmation() {} },
+      },
+      commands: [PlaceOrder],
+      events: [OrderWasPlaced],
+      listeners: [forgedQueued],
+      effects: [SendOrderConfirmation],
+      projectors: [],
+      queries: [],
+    });
+
+    await assert.rejects(
+      () => forgedQueuedApp.dispatch(PlaceOrder, { customerId: 42 }),
+      /Invalid queued-effect returned by handler/,
+    );
+    assert.equal(eventCount(database), 0);
   } finally {
     database.close();
   }
@@ -317,6 +445,113 @@ Deno.test("rolls back earlier writes when a projector writes outside its table",
       (database.prepare("SELECT value FROM other").get() as { value: number })
         .value,
       1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+Deno.test("rejects duplicate resource types during registration", () => {
+  const database = createDatabase();
+  const DuplicatePlaceOrder = command({
+    type: "PlaceOrder",
+    input: z.object({ customerId: z.number().int() }),
+    handle(context, input) {
+      return context.raise(OrderWasPlaced, input);
+    },
+  });
+
+  try {
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [PlaceOrder, DuplicatePlaceOrder],
+          events: [OrderWasPlaced],
+          listeners: [],
+          effects: [],
+          projectors: [],
+          queries: [],
+        }),
+      /Duplicate command type: PlaceOrder/,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+Deno.test("validates static definition dependencies during registration", () => {
+  const database = createDatabase();
+  const UnregisteredOrderWasPlaced = event({
+    type: "OrderWasPlaced",
+    data: OrderWasPlaced.data,
+  });
+  const InvalidListener = listener({
+    type: "InvalidListener",
+    on: UnregisteredOrderWasPlaced,
+    handle() {},
+  });
+  const InvalidProjector = projector({
+    type: "InvalidProjector",
+    table: "users",
+    schema: Users.schema,
+    apply: [project(UnregisteredOrderWasPlaced, () => sql`SELECT 1`)],
+  });
+  const UnregisteredUsers = projector({
+    type: "Users",
+    table: "users",
+    schema: Users.schema,
+    apply: [],
+  });
+  const InvalidQuery = query({
+    type: "InvalidQuery",
+    input: z.object({}),
+    reads: [UnregisteredUsers],
+    output: z.array(Users.schema),
+    run() {
+      return sql`SELECT customer_id AS customerId FROM users`;
+    },
+  });
+
+  try {
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [],
+          events: [OrderWasPlaced],
+          listeners: [InvalidListener],
+          effects: [],
+          projectors: [],
+          queries: [],
+        }),
+      /Unregistered event: OrderWasPlaced/,
+    );
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [],
+          events: [OrderWasPlaced],
+          listeners: [],
+          effects: [],
+          projectors: [InvalidProjector],
+          queries: [],
+        }),
+      /Unregistered event: OrderWasPlaced/,
+    );
+    assert.throws(
+      () =>
+        kernel({
+          env: { database },
+          commands: [],
+          events: [OrderWasPlaced],
+          listeners: [],
+          effects: [],
+          projectors: [Users],
+          queries: [InvalidQuery],
+        }),
+      /Unregistered projector: Users/,
     );
   } finally {
     database.close();
